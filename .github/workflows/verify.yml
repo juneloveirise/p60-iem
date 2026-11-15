@@ -1,0 +1,27 @@
+name: Verify FIR export
+on: [push, pull_request]
+jobs:
+  verify:
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt
+      - run: python verify.py
+      - name: Build the 96 kHz adaptive engine
+        shell: bash
+        run: |
+          git clone --branch v4.1.3 --depth 1 https://github.com/HEnquist/camilladsp.git upstream
+          git -C upstream apply "$PWD/engine/wide-adaptive.patch"
+          cargo build --release --locked --manifest-path upstream/Cargo.toml
+      - name: Verify adaptive processing
+        shell: bash
+        run: |
+          binary=upstream/target/release/camilladsp
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          python verify_engine.py "$binary"

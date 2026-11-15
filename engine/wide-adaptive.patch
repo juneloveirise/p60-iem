@@ -1,0 +1,162 @@
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -1488,6 +1488,7 @@
+ #[serde(tag = "type")]
+ #[serde(deny_unknown_fields)]
+ pub enum Processor {
++    WideAdaptive,
+     Compressor {
+         #[serde(default)]
+         description: Option<String>,
+--- a/src/config/utils.rs
++++ b/src/config/utils.rs
+@@ -753,6 +753,11 @@
+                                             }
+                                         }
+                                     }
++                                    Processor::WideAdaptive => {
++                                        if num_channels != 4 || conf.devices.samplerate != 96000 {
++                                            return Err(ConfigError::new("WideAdaptive requires four channels at 96 kHz").into());
++                                        }
++                                    }
+                                     Processor::RACE { parameters, .. } => {
+                                         let channels = parameters.channels;
+                                         if channels != num_channels {
+--- a/src/pipeline.rs
++++ b/src/pipeline.rs
+@@ -235,6 +235,7 @@
+                         debug!("Add Processor step with processor {}", step.name);
+                         let procconf = conf.processors.as_ref().unwrap()[&step.name].clone();
+                         let proc = match procconf {
++                            config::Processor::WideAdaptive => Box::new(processors::adaptive::WideAdaptive::new(&step.name)) as Box<dyn Processor>,
+                             config::Processor::Compressor { parameters, .. } => {
+                                 let comp = processors::compressor::Compressor::from_config(
+                                     &step.name,
+--- a/src/processors/mod.rs
++++ b/src/processors/mod.rs
+@@ -18,6 +18,7 @@
+ use crate::audiochunk::AudioChunk;
+ use crate::config;
+ 
++pub mod adaptive;
+ pub mod compressor;
+ pub mod noisegate;
+ pub mod race;
+--- /dev/null
++++ b/src/processors/adaptive.rs
+@@ -0,0 +1,115 @@
++use super::Processor;
++use crate::{PrcFmt, Res, audiochunk::AudioChunk, config};
++
++const WIDTH: usize = 240;
++const HISTORY: usize = WIDTH * 2 - 1;
++const LEAD: usize = 672;
++const ENERGY_POLE: f64 = 0.8824969025845955;
++const WEIGHT_POLE: f64 = 0.6065306597126334;
++const SOS: [[f64; 5]; 4] = [
++    [0.0002335133850777953, 0.0004670267701555906, 0.0002335133850777953, -1.6361572304867764, 0.7424849832380384],
++    [1.0, 2.0, 1.0, -1.7661057551045234, 0.8168328155988342],
++    [1.0, -2.0, 1.0, -1.6902219054096002, 0.8680478660205013],
++    [1.0, -2.0, 1.0, -1.905489213888433, 0.9397718575567755],
++];
++
++pub struct WideAdaptive {
++    name: String,
++    filter: [[[f64; 2]; 4]; 4],
++    power: Box<[[f64; 4]; HISTORY]>,
++    audio: Box<[[f64; 4]; LEAD]>,
++    energy: [f64; 4],
++    power_cursor: usize,
++    audio_cursor: usize,
++    phase: usize,
++    previous: f64,
++    next: f64,
++}
++
++impl WideAdaptive {
++    pub fn new(name: &str) -> Self {
++        Self {
++            name: name.to_owned(),
++            filter: Default::default(),
++            power: Box::new([[0.0; 4]; HISTORY]),
++            audio: Box::new([[0.0; 4]; LEAD]),
++            energy: [0.0; 4],
++            power_cursor: 0,
++            audio_cursor: 0,
++            phase: 0,
++            previous: 1.0,
++            next: 1.0,
++        }
++    }
++
++    fn update_weight(&mut self) {
++        let mut sampled = [0.0; 4];
++        for age in 0..HISTORY {
++            let weight = (age + 1).min(HISTORY - age) as f64 / WIDTH as f64;
++            let frame = self.power[(self.power_cursor + age) % HISTORY];
++            for (sum, power) in sampled.iter_mut().zip(frame) {
++                *sum += weight * power;
++            }
++        }
++        for (energy, power) in self.energy.iter_mut().zip(sampled) {
++            *energy = ENERGY_POLE * *energy + (1.0 - ENERGY_POLE) * power;
++        }
++        let left = (self.energy[2] + 1e-14) / (self.energy[0] + 1e-14);
++        let right = (self.energy[3] + 1e-14) / (self.energy[1] + 1e-14);
++        let loss = (-10.0 * left.min(right).log10()).max(0.0);
++        let target = (1.0 - loss / 0.15).clamp(0.0, 1.0);
++        self.previous = self.next;
++        self.next = WEIGHT_POLE * self.next + (1.0 - WEIGHT_POLE) * target;
++    }
++
++    fn process_frame(&mut self, frame: [f64; 4]) -> [f64; 2] {
++        for (channel, mut sample) in frame.into_iter().enumerate() {
++            for ([b0, b1, b2, a1, a2], state) in SOS.into_iter().zip(&mut self.filter[channel]) {
++                let filtered = b0 * sample + state[0];
++                state[0] = b1 * sample - a1 * filtered + state[1];
++                state[1] = b2 * sample - a2 * filtered;
++                sample = filtered;
++            }
++            self.power[self.power_cursor][channel] = sample * sample;
++        }
++        let delayed = self.audio[self.audio_cursor];
++        self.audio[self.audio_cursor] = frame;
++        let weight = self.previous + (self.next - self.previous) * self.phase as f64 / WIDTH as f64;
++        let result = [
++            delayed[0] + weight * (delayed[2] - delayed[0]),
++            delayed[1] + weight * (delayed[3] - delayed[1]),
++        ];
++        self.power_cursor = (self.power_cursor + 1) % HISTORY;
++        self.audio_cursor = (self.audio_cursor + 1) % LEAD;
++        self.phase += 1;
++        if self.phase == WIDTH {
++            self.phase = 0;
++            self.update_weight();
++        }
++        result
++    }
++}
++
++impl Processor for WideAdaptive {
++    fn process_chunk(&mut self, chunk: &mut AudioChunk) -> Res<()> {
++        for index in 0..chunk.frames {
++            let frame = std::array::from_fn(|channel| {
++                chunk.waveforms[channel].get(index).copied().unwrap_or(0.0) as f64
++            });
++            let [left, right] = self.process_frame(frame);
++            for (channel, sample) in [left, right].into_iter().enumerate() {
++                if chunk.waveforms[channel].is_empty() {
++                    chunk.waveforms[channel].resize(chunk.frames, 0.0);
++                }
++                chunk.waveforms[channel][index] = sample as PrcFmt;
++            }
++        }
++        Ok(())
++    }
++
++    fn update_parameters(&mut self, _: config::Processor) {}
++
++    fn name(&self) -> &str {
++        &self.name
++    }
++}
