@@ -33,6 +33,8 @@ python -m venv .venv
 - 频响按 500 Hz 对齐，限制校正幅度，频带两端渐退。当前使用一条共同测量曲线处理两耳。生成的幅度校正采用线性相位 FIR。两套声场滤波使用 P60 的基础与加宽复数侧/中传递比。96 kHz 导出实时自适应混合，44.1 和 48 kHz 导出固定 50% 混合。
 - ZIP 含 WAV、TEXT、频响 CSV、预衰减与数字样本余量报告，以及标准 CamillaDSP 文件输入输出配置。在解压目录运行 `camilladsp camilladsp-offline.yml`，输入为所选采样率的双声道交错 float32 little-endian `input.raw`，输出为 `output.raw`。配置的输入输出由用户另行接到播放设备。FIR 已计入预衰减。
 - 数字余量按每路卷积系数绝对值和计算，覆盖 FIR 输出的样本峰值。模拟输出和采样点之间的峰值需另行验证。
+- 当低频需要削减，且测量与目标共同覆盖到 20 Hz 时，校正可从共同起测频率的四分之一处渐入。起测频率从 20 Hz 升到约 28.3 Hz，延伸强度按余弦窗逐渐降为零。起测点以下按端点估计。例如，曲线从 25 Hz 开始时，如果耳机在 20–25 Hz 自然急降，延伸可能把低音削减过多。
+- 低频延伸沿用原预衰减。生成器分别核对静态、基础和加宽输出在 TEXT 与 float32 WAV 中的卷积系数行绝对值和。只要六项中有一项超过原方案对应值，就整组采用原滤波器。`report.json` 中的 `bass_cut_extension_applied` 表示是否采用延伸，`bass_cut_extension_coverage_weight` 是测量覆盖程度对应的权重，`bass_cut_extension_headroom_fallback` 表示是否因数字余量而回退。
 
 `eq-response.csv` 给出导出包内公共校正 FIR（`eq_only.txt`）的实际增益、相位和群延迟。增益包含预衰减，相位和群延迟已扣除 FIR 中心延时，幅值接近数值零点时后二者记为 NaN。每行对应 Hz、dB、度和 ms。相位在 Hz 轴上插值，使测量时钟的固定延时可在拟合时消除。
 

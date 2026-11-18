@@ -8,7 +8,18 @@ import numpy as np
 from scipy.io import wavfile
 from scipy.signal import fftconvolve
 
-from iem import bundle, design, read_curve, read_inputs, read_measurement, read_phase
+import iem
+from iem import (
+    _blend_filters_with_bound,
+    _matrix_l1_bound,
+    _matrix_l1_rows,
+    bundle,
+    design,
+    read_curve,
+    read_inputs,
+    read_measurement,
+    read_phase,
+)
 
 fixtures = Path(__file__).parent / "examples"
 measurement, phase = [
@@ -251,3 +262,208 @@ for rate in (44100, 48000, 96000):
     for name, values in original["filters"].items():
         np.testing.assert_allclose(shifted["filters"][name], values, atol=2e-12, rtol=0)
 print("The seven FIRs are invariant to a fixed phase offset and time shift at all three rates")
+
+
+def exported_matrix_bounds(result):
+    with zipfile.ZipFile(io.BytesIO(bundle(result))) as archive:
+        filters = {"text": {}, "wav": {}}
+        for prefix in ("", "base_", "wide_"):
+            for name in ("direct", "cross"):
+                key = prefix + name
+                filters["text"][key] = np.loadtxt(
+                    io.BytesIO(archive.read(key + ".txt"))
+                )
+                wav_rate, values = wavfile.read(io.BytesIO(archive.read(key + ".wav")))
+                assert wav_rate == result["rate"]
+                filters["wav"][key] = values.astype(np.float64)
+        return {
+            f"{precision}:{prefix or 'static'}": sum(
+                np.abs(filters[precision][prefix + name]).sum(dtype=np.float64)
+                for name in ("direct", "cross")
+            )
+            for precision in ("text", "wav")
+            for prefix in ("", "base_", "wide_")
+        }
+
+
+def baseline_design(measurement, phase, rate):
+    blend = iem._blend_filters_with_bound
+    try:
+        iem._blend_filters_with_bound = lambda baseline, candidate, weight: (
+            baseline, False, False
+        )
+        return design(measurement, phase, rate, demo=True)
+    finally:
+        iem._blend_filters_with_bound = blend
+
+
+# Coverage interpolation operates on the already-gained FIRs and rejects a
+# mixed result if any static, base, or wide TEXT/float32 row exceeds baseline.
+guard_baseline = {
+    "eq_only": np.zeros(17),
+    **{prefix + name: np.zeros(17)
+       for prefix in ("", "base_", "wide_")
+       for name in ("direct", "cross")},
+}
+guard_baseline["direct"][8] = 0.2
+guard_baseline["cross"][8] = 0.1
+guard_baseline["base_direct"][8] = 0.125
+guard_baseline["base_cross"][8] = 0.125
+guard_baseline["wide_direct"][8] = 0.25
+guard_baseline["wide_cross"][8] = 0.15
+guard_candidate = {name: values * 0.5 for name, values in guard_baseline.items()}
+guard_mix, guard_applied, guard_fallback = _blend_filters_with_bound(
+    guard_baseline, guard_candidate, 0.75
+)
+assert guard_applied and not guard_fallback
+np.testing.assert_allclose(guard_mix["direct"], guard_baseline["direct"] * 0.625)
+assert _matrix_l1_bound(guard_mix) <= _matrix_l1_bound(guard_baseline)
+unsafe_candidate = {name: values.copy() for name, values in guard_baseline.items()}
+unsafe_candidate["base_cross"][0] = 0.1
+unsafe_mixed = {
+    name: values + 0.75 * (unsafe_candidate[name] - values)
+    for name, values in guard_baseline.items()
+}
+assert _matrix_l1_bound(unsafe_mixed) <= _matrix_l1_bound(guard_baseline)
+assert _matrix_l1_rows(unsafe_mixed)["float64:base_"] > _matrix_l1_rows(
+    guard_baseline
+)["float64:base_"]
+guard_mix, guard_applied, guard_fallback = _blend_filters_with_bound(
+    guard_baseline, unsafe_candidate, 0.75
+)
+assert not guard_applied and guard_fallback and guard_mix is guard_baseline
+
+# The pre-change FIRs for this fixed synthetic low-bass excess set the reference
+# gain and complete-row bounds for each output rate.
+baseline_preamp = {44100: -8.2, 48000: -8.2, 96000: -7.5}
+baseline_bound = {
+    44100: 0.8887239183519393,
+    48000: 0.8811276642642343,
+    96000: 0.8826552972498707,
+}
+baseline_margin = {
+    44100: 1.0246626289181495,
+    48000: 1.0992232649318001,
+    96000: 1.0841773606135159,
+}
+baseline_preview_error = {
+    44100: 5.06460652643852,
+    48000: 4.982158651353127,
+    96000: 4.367186587230363,
+}
+low_bass_hz = np.geomspace(20, 20000, 240)
+low_bass_db = np.where(low_bass_hz < 120, 6.0, 0.0)
+low_bass_measurement = (low_bass_hz, low_bass_db)
+
+for rate in (44100, 48000, 96000):
+    corrected = design(low_bass_measurement, rate=rate, demo=True)
+    assert corrected["bass_cut_extension_coverage_weight"] == 1
+    assert corrected["preamp_db"] == baseline_preamp[rate]
+    baseline_result = baseline_design(low_bass_measurement, None, rate)
+    baseline_rows = exported_matrix_bounds(baseline_result)
+    final_rows = exported_matrix_bounds(corrected)
+    assert set(final_rows) == set(baseline_rows)
+    assert max(baseline_rows.values()) == baseline_bound[rate]
+    assert all(final_rows[key] <= baseline_rows[key] + 1e-12 for key in baseline_rows)
+    assert corrected["sample_peak_margin_db"] >= baseline_margin[rate] - 1e-12
+    assert corrected["bass_cut_extension_applied"] is (rate == 96000)
+    assert corrected["bass_cut_extension_headroom_fallback"] is (rate != 96000)
+    np.testing.assert_allclose(corrected["latency_ms"], 1000 * 4096 / rate)
+
+    preview_error = corrected["preview"][0, 3] - corrected["preview"][0, 2]
+    if rate != 96000:
+        # Truncation/windowing leaves a residual; compare to the old FIR value.
+        np.testing.assert_allclose(
+            preview_error,
+            baseline_preview_error[rate],
+            atol=1e-9,
+        )
+    else:
+        assert abs(preview_error) < abs(baseline_preview_error[rate])
+
+    with zipfile.ZipFile(io.BytesIO(bundle(corrected))) as archive:
+        report = json.loads(archive.read("report.json"))
+        assert report["bass_cut_extension_applied"] == corrected["bass_cut_extension_applied"]
+        assert report["bass_cut_extension_coverage_weight"] == 1
+        assert report["bass_cut_extension_headroom_fallback"] == (
+            rate != 96000
+        )
+        assert report["fir_center_samples"] == 4096
+        if rate == 96000:
+            np.testing.assert_allclose(
+                report["adaptive_reference_delay_ms"], 1000 * 4768 / rate
+            )
+
+    with_phase = design(
+        low_bass_measurement,
+        (phase_hz, shape_deg),
+        rate,
+        demo=True,
+    )
+    time_shifted = design(
+        low_bass_measurement,
+        (phase_hz, wrapped_deg),
+        rate,
+        demo=True,
+    )
+    assert with_phase["bass_cut_extension_applied"] is time_shifted[
+        "bass_cut_extension_applied"
+    ]
+    assert with_phase["bass_cut_extension_headroom_fallback"] is time_shifted[
+        "bass_cut_extension_headroom_fallback"
+    ]
+    for name, values in with_phase["filters"].items():
+        np.testing.assert_allclose(time_shifted["filters"][name], values, atol=2e-12, rtol=0)
+
+    baseline_phase = baseline_design(
+        low_bass_measurement, (phase_hz, shape_deg), rate
+    )
+    sample_hz = np.array([30, 60, 120, 240, 500, 1000, 2000, 4000])
+    offsets = np.arange(8193) - 4096
+
+    def centered_response(values, hz):
+        return np.array([
+            np.sum(values * np.exp(-2j * np.pi * frequency * offsets / rate))
+            for frequency in hz
+        ])
+
+    before = centered_response(baseline_phase["filters"]["eq_only"], sample_hz)
+    after = centered_response(with_phase["filters"]["eq_only"], sample_hz)
+    phase_delta = np.angle(after / before, deg=True)
+    assert np.max(np.abs(phase_delta)) < 0.001
+
+# A shorter covered band fades the candidate, while no lower-end data or a
+# low-frequency boost leaves the current correction selected.
+partial_hz = np.geomspace(22, 20000, 240)
+partial = design(
+    (partial_hz, np.where(partial_hz < 120, 6.0, 0.0)), rate=96000, demo=True
+)
+expected_weight = 0.5 * (
+    1 + np.cos(np.pi * np.clip(np.log2(22 / 20) / 0.5, 0, 1))
+)
+np.testing.assert_allclose(partial["bass_cut_extension_coverage_weight"], expected_weight)
+assert partial["bass_cut_extension_applied"]
+
+threshold_hz = np.geomspace(20 * np.sqrt(2), 20000, 240)
+threshold = design(
+    (threshold_hz, np.where(threshold_hz < 120, 6.0, 0.0)), rate=96000, demo=True
+)
+assert threshold["bass_cut_extension_coverage_weight"] == 0
+assert not threshold["bass_cut_extension_applied"]
+uncovered_hz = np.geomspace(55, 20000, 240)
+uncovered = design(
+    (uncovered_hz, np.where(uncovered_hz < 120, 6.0, 0.0)), rate=96000, demo=True
+)
+assert uncovered["bass_cut_extension_coverage_weight"] == 0
+assert not uncovered["bass_cut_extension_applied"]
+
+boosted = design(
+    (low_bass_hz, np.where(low_bass_hz < 120, -6.0, 0.0)),
+    rate=96000,
+    demo=True,
+)
+assert boosted["bass_cut_extension_coverage_weight"] == 1
+assert not boosted["bass_cut_extension_applied"]
+assert not boosted["bass_cut_extension_headroom_fallback"]
+
+print("Negative bass extension passes coverage, fixed-gain, TEXT/WAV headroom, and phase-delay checks")

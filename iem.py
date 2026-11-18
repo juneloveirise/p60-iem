@@ -244,6 +244,57 @@ def minphase_spectrum(db):
     return np.exp(np.fft.rfft(cepstrum))
 
 
+def _endpoint_filters(common, base_ratio, wide_ratio, spatial_support, nfft, taps):
+    center = taps // 2
+
+    def truncate(spectrum):
+        impulse = np.fft.fftshift(np.fft.irfft(spectrum, nfft))
+        return impulse[nfft//2-center:nfft//2+center+1] * np.kaiser(taps, 5)
+
+    def side_path(ratio):
+        return truncate(common * (1 + (ratio - 1) * spatial_support))
+
+    mid = truncate(common)
+    base = side_path(base_ratio)
+    wide = side_path(wide_ratio)
+    sides = {"": (base + wide) / 2, "base_": base, "wide_": wide}
+    pairs = {prefix: ((mid + side) / 2, (mid - side) / 2)
+             for prefix, side in sides.items()}
+    filters = {"eq_only": mid}
+    for prefix, (direct, cross) in pairs.items():
+        filters[prefix + "direct"] = direct
+        filters[prefix + "cross"] = cross
+    return filters
+
+
+def _matrix_l1_rows(filters, dtypes=(np.float64, np.float32)):
+    bounds = {}
+    for dtype in dtypes:
+        for prefix in ("", "base_", "wide_"):
+            bounds[f"{np.dtype(dtype).name}:{prefix or 'static'}"] = sum(
+                np.abs(filters[prefix + name].astype(dtype, copy=False))
+                .sum(dtype=np.float64)
+                for name in ("direct", "cross")
+            )
+    return bounds
+
+
+def _matrix_l1_bound(filters, dtypes=(np.float64, np.float32)):
+    return float(max(_matrix_l1_rows(filters, dtypes).values()))
+
+
+def _blend_filters_with_bound(baseline, candidate, weight):
+    if weight <= 0 or all(np.array_equal(baseline[key], candidate[key]) for key in baseline):
+        return baseline, False, False
+    mixed = {key: baseline[key] + weight * (candidate[key] - baseline[key])
+             for key in baseline}
+    baseline_rows = _matrix_l1_rows(baseline)
+    mixed_rows = _matrix_l1_rows(mixed)
+    if any(mixed_rows[key] > baseline_rows[key] for key in baseline_rows):
+        return baseline, False, True
+    return mixed, True, False
+
+
 def design(measurement, phase=None, rate=96000, *, demo=False):
     if rate not in (44100, 48000, 96000):
         raise ValueError("采样率须为 44100、48000 或 96000")
@@ -276,9 +327,12 @@ def design(measurement, phase=None, rate=96000, *, demo=False):
     at = lambda values: float(np.interp(anchor, frequency, values))
     measured_db -= at(measured_db)
     target_db -= at(target_db)
-    eq_db = np.clip(target_db-measured_db, -12, 6)*support(lo,hi)
+    correction_db = np.clip(target_db-measured_db, -12, 6)
+    magnitude_support = support(lo, hi)
+    eq_db = correction_db * magnitude_support
     # Zero-phase magnitude EQ, realized below as a delayed finite FIR.
     common = 10**(eq_db/20) + 0j
+    phase_correction = None
     if phase is not None:
         # Input is measured acoustic phase in degrees, on a consistent timing reference.
         # A fixed measurement delay produces phase proportional to Hz.
@@ -292,48 +346,65 @@ def design(measurement, phase=None, rate=96000, *, demo=False):
         fit = (frequency >= 300) & (frequency <= 1000) & (frequency >= lo) & (frequency <= hi)
         slope, offset = np.polyfit(frequency[fit], remainder[fit], 1)
         inverse = -np.clip(remainder - (slope*frequency+offset), -np.pi/3, np.pi/3)
-        common *= np.exp(1j*inverse*support(max(phase_lo,200),min(phase_hi,10000)))
+        phase_correction = np.exp(
+            1j * inverse * support(max(phase_lo, 200), min(phase_hi, 10000))
+        )
+        common *= phase_correction
 
-    center = taps//2
-    def truncate(spectrum):
-        impulse = np.fft.fftshift(np.fft.irfft(spectrum, nfft))
-        return impulse[nfft//2-center:nfft//2+center+1]*np.kaiser(taps, 5)
-
-    def side_path(real, imag):
-        ratio = log_interpolate((ref_hz, real), frequency)
-        ratio = ratio + 1j*log_interpolate((ref_hz, imag), frequency)
-        return truncate(common*(1+(ratio-1)*support(lo,hi)))
-
-    mid = truncate(common)
-    base = side_path(base_real,base_imag)
-    wide = side_path(wide_real,wide_imag)
-    sides = {"": (base+wide)/2, "base_": base, "wide_": wide}
-    pairs = {prefix: ((mid+side)/2,(mid-side)/2) for prefix,side in sides.items()}
-
-    def bound(pair):
-        return float(sum(np.abs(x).sum(dtype=np.float64) for x in pair))
+    base_ratio = log_interpolate((ref_hz, base_real), frequency)
+    base_ratio = base_ratio + 1j * log_interpolate((ref_hz, base_imag), frequency)
+    wide_ratio = log_interpolate((ref_hz, wide_real), frequency)
+    wide_ratio = wide_ratio + 1j * log_interpolate((ref_hz, wide_imag), frequency)
+    baseline_raw = _endpoint_filters(
+        common, base_ratio, wide_ratio, magnitude_support, nfft, taps
+    )
 
     # A sample-wise convex blend of the two capped stereo pairs cannot
     # exceed their maximum bound, even with a time-varying blend weight.
-    kernel_bound = max(map(bound,pairs.values()))
+    kernel_bound = _matrix_l1_bound(baseline_raw, dtypes=(np.float64,))
     preamp_db = float(min(0, np.floor((-20*np.log10(kernel_bound)-1)*10)/10))
     gain = 10**(preamp_db/20)
-    filters = {"eq_only": mid*gain}
-    for prefix,(direct,cross) in pairs.items():
-        filters[prefix+"direct"] = direct*gain
-        filters[prefix+"cross"] = cross*gain
-    margins = []
-    for prefix in pairs:
-        pair = [filters[prefix+k] for k in ("direct","cross")]
-        rendered_bound = max(bound(pair),bound([x.astype(np.float32) for x in pair]))
-        margins.append(-20*np.log10(rendered_bound))
-    margin = float(min(margins))
+    baseline = {name: values * gain for name, values in baseline_raw.items()}
+    filters = baseline
+    mid = baseline_raw["eq_only"]
+    coverage_span = np.clip(np.log2(lo / 20) / 0.5, 0, 1)
+    coverage_weight = (
+        0.0 if lo >= 20 * np.sqrt(2)
+        else float(0.5 * (1 + np.cos(np.pi * coverage_span)))
+    )
+    extension_support = support(lo / 4, hi)
+    needs_low_cut = np.any((correction_db < 0) & (extension_support > magnitude_support))
+    extension_applied = False
+    extension_headroom_fallback = False
+    if coverage_weight > 0 and needs_low_cut:
+        extended_eq_db = (
+            np.maximum(correction_db, 0) * magnitude_support
+            + np.minimum(correction_db, 0) * extension_support
+        )
+        extended_common = 10**(extended_eq_db/20) + 0j
+        if phase_correction is not None:
+            extended_common *= phase_correction
+        candidate_raw = _endpoint_filters(
+            extended_common, base_ratio, wide_ratio, magnitude_support, nfft, taps
+        )
+        candidate = {name: values * gain for name, values in candidate_raw.items()}
+        filters, extension_applied, extension_headroom_fallback = _blend_filters_with_bound(
+            baseline, candidate, coverage_weight
+        )
+        if extension_applied:
+            mid = mid + coverage_weight * (candidate_raw["eq_only"] - mid)
+
+    margin = float(-20 * np.log10(_matrix_l1_bound(filters)))
     assert margin >= .99
+    center = taps // 2
     realized = 20*np.log10(np.maximum(abs(np.fft.rfft(mid,nfft)),1e-12))
     selection = np.geomspace(lo,hi,256)
     preview = np.column_stack([selection, *(np.interp(selection,frequency,x)
                               for x in (measured_db,target_db,measured_db+realized))])
     return dict(rate=rate, target="Synthetic demo" if demo else "P50 P60", spatial="WideAdaptive" if rate==96000 else "P60 fixed 50% blend", phase_used=phase is not None, preamp_db=preamp_db,
+                bass_cut_extension_applied=extension_applied,
+                bass_cut_extension_coverage_weight=coverage_weight,
+                bass_cut_extension_headroom_fallback=extension_headroom_fallback,
                 sample_peak_margin_db=margin, latency_ms=1000*center/rate,
                 preview=preview, filters=filters)
 
