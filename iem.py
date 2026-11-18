@@ -1,5 +1,6 @@
 """Offline IEM correction and stereo FIR export."""
 import argparse
+import csv
 import io
 import json
 from pathlib import Path
@@ -8,26 +9,227 @@ import zipfile
 
 import numpy as np
 from scipy.io import wavfile
+from scipy.signal import freqz
 
 
-def read_curve(text, column=1):
+def _split_fields(line):
+    if "," in line:
+        return next(csv.reader([line], skipinitialspace=True))
+    if ";" in line:
+        return next(csv.reader([line], delimiter=";", skipinitialspace=True))
+    if "\t" in line:
+        return next(csv.reader([line], delimiter="\t", skipinitialspace=True))
+    return re.findall(
+        r"(?:phase\s+(?:coherence|quality)|(?:left|right)\s+(?:channel|dB)"
+        r"|\S+(?:\s+\([^)]*\))?)",
+        line.strip(),
+        flags=re.IGNORECASE,
+    )
+
+
+def _header_token(value):
+    return re.sub(r"[^a-z0-9]+", "", value.strip().lstrip("#").casefold())
+
+
+def _looks_like_header(fields):
+    tokens = [_header_token(field) for field in fields]
+    has_frequency = any("freq" in name or name == "hz" for name in tokens)
+    has_value = any(
+        "db" in name or "decibel" in name or "spl" in name
+        or name in {"deg", "degree", "degrees"}
+        or re.fullmatch(r"phase(?:angle)?(?:deg|degree|degrees)", name)
+        for name in tokens
+    )
+    return has_frequency and (has_value or len(fields) == 2)
+
+
+def _parse_table(text):
+    header = None
     rows = []
-    for line in text.splitlines():
-        fields = re.split(r"[,;\s]+", line.strip().lstrip("\ufeff"))
-        try:
-            frequency = float(fields[0])
-        except ValueError:
+    width = None
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip().lstrip("\ufeff")
+        if not line:
             continue
+        if line.startswith(("#", "*")):
+            candidate = _split_fields(line[1:].strip())
+            if not rows and _looks_like_header(candidate):
+                header = candidate
+            continue
+
+        fields = _split_fields(line)
         try:
-            value = float(fields[column])
-        except (IndexError, ValueError) as exc:
-            raise ValueError("每条数据需要 Hz 和指定的数值列") from exc
-        rows.append((frequency, value))
-    data = np.asarray(sorted(rows))
-    if (len(rows) < 8 or not np.isfinite(data).all()
+            float(fields[0])
+        except ValueError:
+            if rows:
+                raise ValueError(f"第 {line_number} 行不是有效的测量数据")
+            if _looks_like_header(fields):
+                header = fields
+            continue
+
+        try:
+            values = [float(field) for field in fields]
+        except ValueError as exc:
+            raise ValueError(f"第 {line_number} 行含非数字数据") from exc
+        if not np.isfinite(values).all():
+            raise ValueError(f"第 {line_number} 行含非有限数值")
+        if width is None:
+            width = len(values)
+        elif len(values) != width:
+            raise ValueError(f"第 {line_number} 行的列数与前面数据不一致")
+        if header is not None and len(header) != len(values):
+            raise ValueError(f"第 {line_number} 行的列数与表头不一致")
+        rows.append(values)
+
+    if not rows:
+        raise ValueError("文件中没有可用的频率数据")
+    return header, rows
+
+
+def _curve(rows, frequency_column, value_column, frequency_scale=1):
+    try:
+        data = np.asarray(
+            [(row[frequency_column] * frequency_scale, row[value_column]) for row in rows],
+            dtype=float,
+        )
+    except IndexError as exc:
+        raise ValueError("每条数据需要 Hz 和指定的数值列") from exc
+    data = data[np.argsort(data[:, 0])]
+    if (len(data) < 8 or not np.isfinite(data).all()
             or data[0, 0] <= 0 or np.any(np.diff(data[:, 0]) <= 0)):
         raise ValueError("曲线需要至少 8 个唯一且有效的正频率点")
     return data.T
+
+
+def _frequency_column(tokens, width):
+    columns = [i for i, name in enumerate(tokens)
+               if name == "hz" or name.startswith("freq")]
+    if len(columns) > 1:
+        raise ValueError("表头中有多个频率列，请只保留一个")
+    column = columns[0] if columns else (0 if width == 2 else None)
+    if column is None:
+        raise ValueError("多列数据需要用表头标出 Hz 或 Frequency 列")
+    name = tokens[column]
+    if name == "hz":
+        return column, 1
+    base = "frequency" if name.startswith("frequency") else "freq"
+    unit = name[len(base):]
+    if unit not in {"", "hz", "khz", "mhz"}:
+        raise ValueError("频率单位请标为 Hz、kHz 或 MHz")
+    if unit == "mhz":
+        scale = 1_000_000
+    elif unit == "khz":
+        scale = 1_000
+    else:
+        scale = 1
+    return column, scale
+
+
+def _phase_columns(tokens, *, require_degree=True, allow_unqualified=False):
+    degree_names = {"deg", "degree", "degrees", "angledeg",
+                    "angledegree", "angledegrees"}
+    columns = []
+    for index, name in enumerate(tokens):
+        if ("coherence" in name or "quality" in name):
+            continue
+        if name in degree_names or re.fullmatch(r"phase(?:angle)?(?:deg|degree|degrees)", name):
+            columns.append(index)
+        elif "phase" in name and ("rad" in name or "db" in name):
+            if require_degree:
+                if "rad" in name:
+                    raise ValueError("相位列使用弧度，请先转换为度")
+                raise ValueError("相位列标为 dB，单位冲突")
+            columns.append(index)
+        elif name in {"phase", "phaseangle"}:
+            if require_degree and not allow_unqualified:
+                raise ValueError("相位表头需要明确标出 deg 或 degrees")
+            columns.append(index)
+    if require_degree and len(columns) > 1:
+        raise ValueError("表头中有多个角度列，请只保留一个")
+    return columns
+
+
+def read_curve(text, column=1):
+    """Read one Hz/value curve, keeping the legacy default columns."""
+    _, rows = _parse_table(text)
+    return _curve(rows, 0, column)
+
+
+def read_measurement(text, *, use_embedded_phase=True):
+    """Read Hz/dB data and only use phase named explicitly in a table header."""
+    header, rows = _parse_table(text)
+    width = len(rows[0])
+    if header is None:
+        return _curve(rows, 0, 1), None
+
+    tokens = [_header_token(label) for label in header]
+    frequency_column, frequency_scale = _frequency_column(tokens, width)
+    phase_columns = _phase_columns(tokens, require_degree=use_embedded_phase)
+    phase_column = phase_columns[0] if use_embedded_phase and phase_columns else None
+    excluded_columns = set(phase_columns)
+
+    db_columns = [i for i, name in enumerate(tokens)
+                  if i != frequency_column and i not in excluded_columns
+                  and ("db" in name or "decibel" in name)]
+    if len(db_columns) > 1:
+        raise ValueError("表头中有多个 dB 列，请先整理成一条频响曲线")
+    if db_columns:
+        db_column = db_columns[0]
+    else:
+        unassigned = [i for i in range(width)
+                      if i != frequency_column and i not in excluded_columns]
+        if (len(unassigned) == 1 and width == 2
+                and any(tag in tokens[unassigned[0]]
+                        for tag in ("phase", "coherence", "quality", "radian", "degree", "deg"))):
+            raise ValueError("该列未标明为 dB 频响")
+        if len(unassigned) == 1:
+            db_column = unassigned[0]
+        elif width == 2:
+            db_column = 1
+        else:
+            raise ValueError("请在表头标出唯一的 dB 频响列")
+
+    if db_column in excluded_columns:
+        raise ValueError("同一列不能同时作为 dB 频响和相位")
+    measurement = _curve(rows, frequency_column, db_column, frequency_scale)
+    phase = (_curve(rows, frequency_column, phase_column, frequency_scale)
+             if use_embedded_phase and phase_column is not None else None)
+    return measurement, phase
+
+
+def read_phase(text):
+    """Read a separate phase curve with a declared degree unit."""
+    header, rows = _parse_table(text)
+    width = len(rows[0])
+    if header is None:
+        return _curve(rows, 0, 1)
+
+    tokens = [_header_token(label) for label in header]
+    frequency_column, frequency_scale = _frequency_column(tokens, width)
+    phase_columns = _phase_columns(tokens, allow_unqualified=True)
+    if not phase_columns:
+        if any("rad" in name for name in tokens):
+            raise ValueError("相位列使用弧度，请先转换为度")
+        if any("db" in name or "decibel" in name for name in tokens):
+            raise ValueError("相位文件中找到 dB 列，请检查是否误选了频响文件")
+        raise ValueError("相位文件表头需要标出 Phase 或角度单位")
+    phase_column = phase_columns[0]
+    if phase_column == frequency_column:
+        raise ValueError("同一列不能同时作为频率和相位")
+    return _curve(rows, frequency_column, phase_column, frequency_scale)
+
+
+def read_inputs(measurement_text, phase_text=None):
+    """Prefer a separately supplied phase file over a labeled embedded phase."""
+    has_separate_phase = phase_text is not None
+    measurement, embedded_phase = read_measurement(
+        measurement_text, use_embedded_phase=not has_separate_phase
+    )
+    if has_separate_phase:
+        return measurement, read_phase(phase_text), "separate"
+    if embedded_phase is not None:
+        return measurement, embedded_phase, "combined"
+    return measurement, None, None
 
 
 def log_interpolate(curve, frequency):
@@ -79,7 +281,9 @@ def design(measurement, phase=None, rate=96000, *, demo=False):
     common = 10**(eq_db/20) + 0j
     if phase is not None:
         # Input is measured acoustic phase in degrees, on a consistent timing reference.
-        measured_phase = log_interpolate((phase[0], np.unwrap(np.deg2rad(phase[1]))), frequency)
+        # A fixed measurement delay produces phase proportional to Hz.
+        # Interpolating phase on a logarithmic axis would turn it into curvature.
+        measured_phase = np.interp(frequency, phase[0], np.unwrap(np.deg2rad(phase[1])))
         remainder = measured_phase - np.unwrap(np.angle(minphase_spectrum(measured_db)))
         phase_lo = max(lo, phase[0][0])
         phase_hi = min(hi, phase[0][-1])
@@ -228,6 +432,25 @@ def realtime_config(backend, capture, playback):
     return cfg
 
 
+def eq_response(result):
+    """Response of the exported common TEXT FIR, relative to its center tap."""
+    taps = result["filters"]["eq_only"]
+    rate = result["rate"]
+    hz = result["preview"][:, 0]
+    center = (len(taps) - 1) // 2
+    _, transfer = freqz(taps, worN=hz, fs=rate)
+    _, moment = freqz((np.arange(len(taps)) - center) * taps, worN=hz, fs=rate)
+    magnitude = np.abs(transfer)
+    valid = magnitude > 1e-12 * np.sum(np.abs(taps))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        gain_db = 20 * np.log10(magnitude)
+        phase_deg = np.angle(transfer * np.exp(2j * np.pi * hz * center / rate), deg=True)
+        # Re{sum((n - center) h[n] exp(-jwn)) / H} is delay in samples.
+        delay_ms = np.real(moment / transfer) * 1000 / rate
+    return np.column_stack((hz, gain_db, np.where(valid, phase_deg, np.nan),
+                            np.where(valid, delay_ms, np.nan)))
+
+
 def bundle(result, live=None):
     dest = io.BytesIO()
     rate = result["rate"]
@@ -245,12 +468,22 @@ def bundle(result, live=None):
         if live is not None:
             archive.writestr("camilladsp-realtime.yml",json.dumps(live,indent=2))
             archive.writestr("play.py",Path(__file__).with_name("play.py").read_text(encoding="utf-8"))
-        archive.writestr("report.json",json.dumps({k:v for k,v in result.items()
-                                                   if k not in ("filters","preview")},indent=2))
+        report = {k: v for k, v in result.items() if k not in ("filters", "preview")}
+        center = (len(result["filters"]["eq_only"]) - 1) // 2
+        report["fir_center_samples"] = center
+        if rate == 96000:
+            # LEAD in the 96 kHz WideAdaptive processor.
+            report["adaptive_lookahead_samples"] = 672
+            report["adaptive_reference_delay_ms"] = (center + 672) * 1000 / rate
+        archive.writestr("report.json", json.dumps(report, indent=2))
         data = io.StringIO()
         np.savetxt(data,result["preview"],delimiter=",",
                    header="hz,measured_db,target_db,corrected_mono_db",comments="")
         archive.writestr("response.csv",data.getvalue())
+        response = io.StringIO()
+        np.savetxt(response, eq_response(result), delimiter=",", comments="",
+                   header="hz,eq_with_preamp_db,eq_centered_phase_deg,eq_centered_group_delay_ms")
+        archive.writestr("eq-response.csv", response.getvalue())
         archive.writestr("README.txt", "Wet L = direct*L + cross*R; wet R = direct*R + cross*L.\n"
                          "The EQ-only file is an alternative. * denotes convolution. All filters include preamp.\n"
                          "Use camilladsp-adaptive.yml at 96 kHz with the patched engine.\n"
@@ -273,8 +506,12 @@ def main():
         parser.error("--capture and --playback require --backend")
     if args.backend and args.rate != 96000:
         parser.error("Realtime adaptive playback requires 96 kHz")
-    load = lambda path: read_curve(path.read_text(encoding="utf-8-sig"))
-    result = design(load(args.measurement), load(args.phase) if args.phase else None, args.rate, demo=args.demo)
+    phase_text = args.phase.read_text(encoding="utf-8-sig") if args.phase else None
+    measurement, phase, phase_source = read_inputs(
+        args.measurement.read_text(encoding="utf-8-sig"), phase_text
+    )
+    result = design(measurement, phase, args.rate, demo=args.demo)
+    result["phase_source"] = phase_source
     live = realtime_config(args.backend,args.capture,args.playback) if args.backend else None
     args.output.write_bytes(bundle(result,live))
 

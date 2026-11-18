@@ -5,7 +5,7 @@ import platform
 import numpy as np
 import streamlit as st
 
-from iem import bundle, design, read_curve, realtime_config
+from iem import bundle, design, read_inputs, realtime_config
 
 st.set_page_config(page_title="IEM 校正与声场", page_icon="🎧")
 st.title("IEM 校正与声场")
@@ -22,7 +22,7 @@ else:
         return file.getvalue().decode("utf-8-sig") if file else None
 
     try:
-        measurement = upload("耳机频响 · Hz / dB", "measurement")
+        measurement = upload("耳机测量 · Hz / dB，可含 Phase (deg) 列", "measurement")
         phase_text = upload("声学相位（可选）· Hz / 度", "phase")
     except UnicodeDecodeError:
         st.error("请用 UTF-8 保存测量文件。")
@@ -34,10 +34,19 @@ if not measurement:
     st.info("导入耳机频响即可生成。声学相位文件可选，需有可信时间参考。")
     st.stop()
 try:
-    result = design(read_curve(measurement), read_curve(phase_text) if phase_text else None, rate, demo=demo)
+    measured_curve, phase, phase_source = read_inputs(measurement, phase_text)
+    result = design(measured_curve, phase, rate, demo=demo)
+    result["phase_source"] = phase_source
 except ValueError as exc:
     st.error(str(exc))
     st.stop()
+
+if phase_source == "combined":
+    st.caption("已从同一文件中识别带度数单位的 Phase 列。")
+elif phase_source == "separate":
+    st.caption("已使用单独导入的相位文件。")
+else:
+    st.caption("未导入声学相位。")
 
 import pandas as pd
 frame = pd.DataFrame(result["preview"], columns=["Hz", "测量", "目标", "校正后"])

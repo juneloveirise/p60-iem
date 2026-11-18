@@ -27,11 +27,16 @@ python -m venv .venv
 
 ## 输入和输出
 
-- UTF-8 CSV、TSV 或空白分隔的文本。每行先写 Hz，再写 dB 或度。支持普通表头。组合文件中的相位需另存为 Hz 和度两列。频点须唯一。
+- UTF-8 CSV、TSV 或空白分隔的文本。频响每行含频率和 dB，可带表头。频率表头写 Hz 或 Frequency (Hz)，也可写 Frequency (kHz)，程序会换算成 Hz。联合测量文件里的相位表头需明确写成 Phase (deg)、Phase (degrees) 或 Phase (degree)。单独导入的相位文件按度数解释，可用 Hz / Phase 或 Hz / Degrees 表头。标明 Radians 或 dB 的相位列会报错。相位需有可信时间参考。Coherence、quality 等额外列不会被当作相位。若文件同时含左右 dB 列，请先整理成单条频响。频点须唯一且为有限正数。
+- GUI 先选择耳机测量文件，再按需选择单独相位文件。单独文件会优先于测量文件内明确标出的相位列。CLI 示例为 python iem.py measurement.csv filters.zip --phase phase.csv --demo，省略 --phase 时读取测量文件中已标明的相位列。
 - 耳机测量与目标需要可比较的测量基准。相位应来自同次声学测量，有可信的时间参考，且频点足够密以重建展开相位。导入相位后，在 300–1000 Hz 拟合并去掉线性延时及常量。实测相位仍会受测量和佩戴影响。
 - 频响按 500 Hz 对齐，限制校正幅度，频带两端渐退。当前使用一条共同测量曲线处理两耳。生成的幅度校正采用线性相位 FIR。两套声场滤波使用 P60 的基础与加宽复数侧/中传递比。96 kHz 导出实时自适应混合，44.1 和 48 kHz 导出固定 50% 混合。
 - ZIP 含 WAV、TEXT、频响 CSV、预衰减与数字样本余量报告，以及标准 CamillaDSP 文件输入输出配置。在解压目录运行 `camilladsp camilladsp-offline.yml`，输入为所选采样率的双声道交错 float32 little-endian `input.raw`，输出为 `output.raw`。配置的输入输出由用户另行接到播放设备。FIR 已计入预衰减。
 - 数字余量按每路卷积系数绝对值和计算，覆盖 FIR 输出的样本峰值。模拟输出和采样点之间的峰值需另行验证。
+
+`eq-response.csv` 给出导出包内公共校正 FIR（`eq_only.txt`）的实际增益、相位和群延迟。增益包含预衰减，相位和群延迟已扣除 FIR 中心延时，幅值接近数值零点时后二者记为 NaN。每行对应 Hz、dB、度和 ms。相位在 Hz 轴上插值，使测量时钟的固定延时可在拟合时消除。
+
+96 kHz 的 `report.json` 分别记录 FIR 中心的 4096 样本和自适应处理器前视的 672 样本，合计参考延时为 49.667 ms。静态配置只用 FIR；声卡、虚拟设备和引擎分块的延时取决于播放环境。
 
 96 kHz 的 `camilladsp-adaptive.yml` 需要加入 WideAdaptive 的 CamillaDSP。该处理器按帧混合基础和加宽声场，原来的 P60 检测时间和权重规则保持一致。它读取目标耳机的校正后信号，两套滤波的输出按同一个权重混合。预衰减按照两套输出的较坏数字样本上界计算。
 
