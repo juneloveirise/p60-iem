@@ -41,7 +41,7 @@ python -m venv .venv
 git clone --branch v4.1.3 --depth 1 https://github.com/HEnquist/camilladsp.git upstream
 git -C upstream apply --check <补丁绝对路径>
 git -C upstream apply <补丁绝对路径>
-cargo build --release --locked --manifest-path upstream/Cargo.toml
+cargo build --release --manifest-path upstream/Cargo.toml
 ```
 
 补丁路径由 Git 进程解析，请从工具目录传入 `engine/wide-adaptive.patch` 的绝对路径。解压导出包后，在解压目录用编译好的程序运行 `camilladsp-adaptive.yml`。标准引擎仍可用 `camilladsp-offline.yml` 渲染静态对照。
