@@ -341,11 +341,6 @@ baseline_bound = {
     48000: 0.8811276642642343,
     96000: 0.8826552972498707,
 }
-baseline_margin = {
-    44100: 1.0246626289181495,
-    48000: 1.0992232649318001,
-    96000: 1.0841773606135159,
-}
 baseline_preview_error = {
     44100: 5.06460652643852,
     48000: 4.982158651353127,
@@ -363,9 +358,16 @@ for rate in (44100, 48000, 96000):
     baseline_rows = exported_matrix_bounds(baseline_result)
     final_rows = exported_matrix_bounds(corrected)
     assert set(final_rows) == set(baseline_rows)
-    assert max(baseline_rows.values()) == baseline_bound[rate]
-    assert all(final_rows[key] <= baseline_rows[key] + 1e-12 for key in baseline_rows)
-    assert corrected["sample_peak_margin_db"] >= baseline_margin[rate] - 1e-12
+    # The stored fixture includes float32 WAV coefficients. FFT libraries on
+    # different architectures can round them slightly differently. Compare the
+    # guard against the baseline exported on this same host, mode by mode.
+    local_bound = max(baseline_rows.values())
+    np.testing.assert_allclose(local_bound, baseline_bound[rate], rtol=0,
+                               atol=2 * np.finfo(np.float32).eps)
+    assert all(final_rows[key] <= baseline_rows[key] for key in baseline_rows)
+    np.testing.assert_allclose(baseline_result["sample_peak_margin_db"],
+                               -20 * np.log10(local_bound), rtol=0, atol=1e-12)
+    assert corrected["sample_peak_margin_db"] >= baseline_result["sample_peak_margin_db"] - 1e-12
     assert corrected["bass_cut_extension_applied"] is (rate == 96000)
     assert corrected["bass_cut_extension_headroom_fallback"] is (rate != 96000)
     np.testing.assert_allclose(corrected["latency_ms"], 1000 * 4096 / rate)
